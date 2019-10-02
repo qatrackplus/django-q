@@ -15,6 +15,8 @@ import signal
 import socket
 import traceback
 # Django
+import django
+django.setup()
 from django import db
 from django.conf import settings
 from django.utils import timezone
