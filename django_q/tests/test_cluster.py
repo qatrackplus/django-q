@@ -3,6 +3,7 @@ import threading
 from multiprocessing import Event, Value
 from time import sleep
 from django.utils import timezone
+import uuid as uuidlib
 
 import os
 import pytest
@@ -17,11 +18,11 @@ from django_q.models import Task, Success
 from django_q.conf import Conf
 from django_q.status import Stat
 from django_q.brokers import get_broker, Broker
-from django_q.tests.tasks import multiply
+from django_q.tests.tasks import multiply, TaskError
 from django_q.queues import Queue
 
 
-class WordClass(object):
+class WordClass:
     def __init__(self):
         self.word_list = DEFAULT_WORDLIST
 
@@ -43,6 +44,12 @@ def test_redis_connection(broker):
 def test_sync(broker):
     task = async_task('django_q.tests.tasks.count_letters', DEFAULT_WORDLIST, broker=broker, sync=True)
     assert result(task) == 1506
+
+
+@pytest.mark.django_db
+def test_sync_raise_exception(broker):
+    with pytest.raises(TaskError):
+        async_task('django_q.tests.tasks.raise_exception', broker=broker, sync=True)
 
 
 @pytest.mark.django_db
@@ -72,7 +79,8 @@ def test_sentinel():
     start_event = Event()
     stop_event = Event()
     stop_event.set()
-    s = Sentinel(stop_event, start_event, broker=get_broker('sentinel_test:q'))
+    cluster_id = uuidlib.uuid4()
+    s = Sentinel(stop_event, start_event, cluster_id=cluster_id, broker=get_broker('sentinel_test:q'))
     assert start_event.is_set()
     assert s.status() == Conf.STOPPED
 
@@ -134,6 +142,8 @@ def test_enqueue(broker, admin_user):
     # q_options and save opt_out test
     k = async_task('django_q.tests.tasks.get_user_id', admin_user,
                    q_options={'broker': broker, 'group': 'test_k', 'save': False, 'timeout': 90})
+    # test unicode
+    assert Task(name='Amalia').__str__()=='Amalia'
     # check if everything has a task id
     assert isinstance(a, str)
     assert isinstance(b, str)
@@ -256,9 +266,10 @@ def test_timeout(broker, cluster_config_timeout, async_task_kwargs):
     async_task('time.sleep', 5, broker=broker, **async_task_kwargs)
     start_event = Event()
     stop_event = Event()
+    cluster_id = uuidlib.uuid4()
     # Set a timer to stop the Sentinel
     threading.Timer(3, stop_event.set).start()
-    s = Sentinel(stop_event, start_event, broker=broker, timeout=cluster_config_timeout)
+    s = Sentinel(stop_event, start_event, cluster_id=cluster_id, broker=broker, timeout=cluster_config_timeout)
     assert start_event.is_set()
     assert s.status() == Conf.STOPPED
     assert s.reincarnations == 1
@@ -279,9 +290,10 @@ def test_timeout_task_finishes(broker, cluster_config_timeout, async_task_kwargs
     async_task('time.sleep', 3, broker=broker, **async_task_kwargs)
     start_event = Event()
     stop_event = Event()
+    cluster_id = uuidlib.uuid4()
     # Set a timer to stop the Sentinel
     threading.Timer(6, stop_event.set).start()
-    s = Sentinel(stop_event, start_event, broker=broker, timeout=cluster_config_timeout)
+    s = Sentinel(stop_event, start_event, cluster_id=cluster_id, broker=broker, timeout=cluster_config_timeout)
     assert start_event.is_set()
     assert s.status() == Conf.STOPPED
     assert s.reincarnations == 0
@@ -297,12 +309,13 @@ def test_recycle(broker, monkeypatch):
     async_task('django_q.tests.tasks.multiply', 2, 2, broker=broker)
     start_event = Event()
     stop_event = Event()
+    cluster_id = uuidlib.uuid4()
     # override settings
     monkeypatch.setattr(Conf, 'RECYCLE', 2)
     monkeypatch.setattr(Conf, 'WORKERS', 1)
     # set a timer to stop the Sentinel
     threading.Timer(3, stop_event.set).start()
-    s = Sentinel(stop_event, start_event, broker=broker)
+    s = Sentinel(stop_event, start_event, cluster_id=cluster_id, broker=broker)
     assert start_event.is_set()
     assert s.status() == Conf.STOPPED
     assert s.reincarnations == 1
@@ -325,6 +338,40 @@ def test_recycle(broker, monkeypatch):
     assert Success.objects.count() == Conf.SAVE_LIMIT
     broker.delete_queue()
 
+@pytest.mark.django_db
+def test_max_rss(broker, monkeypatch):
+    # set up the Sentinel
+    broker.list_key = 'test_max_rss_test:q'
+    async_task('django_q.tests.tasks.multiply', 2, 2, broker=broker)
+    start_event = Event()
+    stop_event = Event()
+    cluster_id = uuidlib.uuid4()
+    # override settings
+    monkeypatch.setattr(Conf, 'MAX_RSS', 40000)
+    monkeypatch.setattr(Conf, 'WORKERS', 1)
+    # set a timer to stop the Sentinel
+    threading.Timer(3, stop_event.set).start()
+    s = Sentinel(stop_event, start_event, cluster_id=cluster_id, broker=broker)
+    assert start_event.is_set()
+    assert s.status() == Conf.STOPPED
+    assert s.reincarnations == 1
+    async_task('django_q.tests.tasks.multiply', 2, 2, broker=broker)
+    task_queue = Queue()
+    result_queue = Queue()
+    # push the task
+    pusher(task_queue, stop_event, broker=broker)
+    # worker should exit on recycle
+    worker(task_queue, result_queue, Value('f', -1))
+    # check if the work has been done
+    assert result_queue.qsize() == 1
+    # save_limit test
+    monkeypatch.setattr(Conf, 'SAVE_LIMIT', 1)
+    result_queue.put('STOP')
+    # run monitor
+    monitor(result_queue)
+    assert Success.objects.count() == Conf.SAVE_LIMIT
+    broker.delete_queue()
+
 
 @pytest.mark.django_db
 def test_bad_secret(broker, monkeypatch):
@@ -333,13 +380,14 @@ def test_bad_secret(broker, monkeypatch):
     stop_event = Event()
     stop_event.set()
     start_event = Event()
-    s = Sentinel(stop_event, start_event, broker=broker, start=False)
+    cluster_id = uuidlib.uuid4()
+    s = Sentinel(stop_event, start_event, cluster_id=cluster_id, broker=broker, start=False)
     Stat(s).save()
     # change the SECRET
     monkeypatch.setattr(Conf, "SECRET_KEY", "OOPS")
     stat = Stat.get_all()
     assert len(stat) == 0
-    assert Stat.get(s.parent_pid) is None
+    assert Stat.get(pid=s.parent_pid, cluster_id=cluster_id) is None
     task_queue = Queue()
     pusher(task_queue, stop_event, broker=broker)
     result_queue = Queue()
@@ -347,6 +395,41 @@ def test_bad_secret(broker, monkeypatch):
     worker(task_queue, result_queue, Value('f', -1), )
     assert result_queue.qsize() == 0
     broker.delete_queue()
+
+
+@pytest.mark.django_db
+def test_attempt_count(broker, monkeypatch):
+    monkeypatch.setattr(Conf, 'MAX_ATTEMPTS', 3)
+    tag = uuid()
+    task = {'id': tag[1],
+            'name': tag[0],
+            'func': 'math.copysign',
+            'args': (1, -1),
+            'kwargs': {},
+            'started': timezone.now(),
+            'stopped': timezone.now(),
+            'success': False,
+            'result': None}
+    # initial save - no success
+    save_task(task, broker)
+    assert Task.objects.filter(id=task['id']).exists()
+    saved_task = Task.objects.get(id=task['id'])
+    assert saved_task.attempt_count == 1
+    sleep(0.5)
+    # second save
+    old_stopped = task['stopped']
+    task['stopped'] = timezone.now()
+    save_task(task, broker)
+    saved_task = Task.objects.get(id=task['id'])
+    assert saved_task.attempt_count == 2
+    # third save -
+    task['stopped'] = timezone.now()
+    save_task(task, broker)
+    saved_task = Task.objects.get(id=task['id'])
+    assert saved_task.attempt_count == 3
+    # task should be removed from queue
+    assert broker.queue_size() == 0
+
 
 
 @pytest.mark.django_db
@@ -390,6 +473,7 @@ def test_update_failed(broker):
     assert saved_task.success is True
     assert saved_task.result == 'result'
 
+
 @pytest.mark.django_db
 def test_acknowledge_failure_override():
     class VerifyAckMockBroker(Broker):
@@ -423,10 +507,12 @@ def test_acknowledge_failure_override():
 
     tag = uuid()
     task_success_ack = task_fail_ack.copy()
-    task_success_ack.update({'id': tag[1],
-                             'name': tag[0],
-                             'ack_id': 'test_success_ack_id',
-                             'success': True,})
+    task_success_ack.update({
+        'id': tag[1],
+        'name': tag[0],
+        'ack_id': 'test_success_ack_id',
+        'success': True,
+    })
     del task_success_ack['ack_failure']
 
     result_queue = Queue()
@@ -441,6 +527,7 @@ def test_acknowledge_failure_override():
     assert broker.acknowledgements.get('test_fail_ack_id') == 1
     assert broker.acknowledgements.get('test_fail_no_ack_id') is None
     assert broker.acknowledgements.get('test_success_ack_id') == 1
+
 
 @pytest.mark.django_db
 def assert_result(task):

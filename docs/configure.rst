@@ -33,7 +33,7 @@ On most broker types this will be used as the queue name.
 Defaults to ``'default'``.
 
 .. note::
-    Tasks are encrypted. When a worker encounters a task it can not decrypt, it will be discarded or failed.
+    Tasks are signed. When a worker encounters a task with an invalid signature, it will be discarded or failed.
 
 workers
 ~~~~~~~
@@ -51,6 +51,13 @@ recycle
 
 The number of tasks a worker will process before recycling . Useful to release memory resources on a regular basis. Defaults to ``500``.
 
+max_rss
+~~~~~~~
+
+The maximum resident set size in kilobytes before a worker will recycle and release resources. Useful for limiting memory usage.
+Only supported on platforms that implement the python resource module or install the :ref:`psutil<psutil_package>` module.
+Defaults to ``None``.
+
 .. _timeout:
 
 timeout
@@ -67,6 +74,15 @@ ack_failures
 ~~~~~~~~~~~~
 
 When set to ``True``, also acknowledge unsuccessful tasks. This causes failed tasks to be considered as successful deliveries, thereby removing them from the task queue. Can also be set per-task by passing the ``ack_failure`` option to :func:`async_task`. Defaults to ``False``.
+
+
+.. _max_attempts:
+
+max_attempts
+~~~~~~~~~~~~~
+
+Limit the number of retry attempts for failed tasks. Set to 0 for infinite retries. Defaults to 0
+
 
 .. _retry:
 
@@ -180,6 +196,12 @@ Connection settings for Redis. Defaults::
         }
     }
 
+It's also possible to use a Redis connection URI::
+
+    Q_CLUSTER = {
+        'redis': 'redis://h:asdfqwer1234asdf@ec2-111-1-1-1.compute-1.amazonaws.com:111'
+    }
+
 For more information on these settings please refer to the `Redis-py <https://github.com/andymccurdy/redis-py>`__ documentation
 
 .. _django_redis:
@@ -201,7 +223,7 @@ of the cache connection you want to use instead of a direct Redis connection::
 
 
 .. tip::
-    Django Q uses your ``SECRET_KEY`` to encrypt task packages and prevent task crossover. So make sure you have it set up in your Django settings.
+    Django Q uses your ``SECRET_KEY`` to sign task packages and prevent task crossover. So make sure you have it set up in your Django settings.
 
 .. _disque_configuration:
 
@@ -378,7 +400,7 @@ Defaults to ``0.2`` (seconds).
 
 cache
 ~~~~~
-For some brokers, you will need to set up the Django `cache framework <https://docs.djangoproject.com/en/1.8/topics/cache/#setting-up-the-cache>`__
+For some brokers, you will need to set up the Django `cache framework <https://docs.djangoproject.com/en/2.2/topics/cache/#setting-up-the-cache>`__
 to gather statistics for the monitor. You can indicate which cache to use by setting this value. Defaults to ``default``.
 
 .. _cached:
